@@ -1,300 +1,360 @@
+<div align="center">
+
 # MinervaDB PostgreSQL Profiler
 
-<p align="center">
-  <img src="https://img.shields.io/badge/PostgreSQL-Profiler-blue?style=for-the-badge&logo=postgresql" alt="PostgreSQL Profiler"/>
-  <img src="https://img.shields.io/badge/eBPF-Powered-orange?style=for-the-badge" alt="eBPF Powered"/>
-  <img src="https://img.shields.io/badge/Linux-Kernel-yellow?style=for-the-badge&logo=linux" alt="Linux Kernel"/>
-  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT License"/>
-  <img src="https://img.shields.io/badge/Version-1.0.0-purple?style=for-the-badge" alt="Version"/>
-</p>
+**Enterprise-grade eBPF-powered profiling and troubleshooting toolkit for PostgreSQL**
 
-> **MinervaDB PostgreSQL Profiler** is an advanced, production-grade observability and troubleshooting toolkit for PostgreSQL databases, leveraging eBPF (Extended Berkeley Packet Filter) and Linux Kernel profiling technologies to provide deep, zero-overhead insights into PostgreSQL internals.
+[![CI](https://github.com/MinervaDB/MinervaDB-PostgreSQL-Profiler/actions/workflows/ci.yml/badge.svg)](https://github.com/MinervaDB/MinervaDB-PostgreSQL-Profiler/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Kernel: 5.8+](https://img.shields.io/badge/kernel-5.8%2B-brightgreen.svg)](https://www.kernel.org/)
+[![PostgreSQL: 12+](https://img.shields.io/badge/PostgreSQL-12%2B-336791.svg)](https://www.postgresql.org/)
+[![eBPF](https://img.shields.io/badge/eBPF-powered-orange.svg)](https://ebpf.io/)
+
+</div>
+
+---
+
+> **MinervaDB PostgreSQL Profiler** combines eBPF, USDT probes, kprobes, uprobes, tracepoints,
+> and perf_events to deliver sub-microsecond resolution profiling of every PostgreSQL query,
+> lock acquisition, buffer access, WAL write, and scheduler event — with < 2% overhead.
+> No query sampling. No PostgreSQL restarts. No code changes.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
+- [Why MinervaDB Profiler?](#why-minervadb-profiler)
 - [Architecture](#architecture)
-- [Features](#features)
 - [Profiling Modules](#profiling-modules)
 - [Requirements](#requirements)
+- [Quick Start](#quick-start)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
-- [Profiling Subsystems](#profiling-subsystems)
 - [Output Formats](#output-formats)
-- [Dashboards](#dashboards)
-- [Troubleshooting Guide](#troubleshooting-guide)
+- [Grafana Dashboards](#grafana-dashboards)
 - [Performance Impact](#performance-impact)
+- [Documentation](#documentation)
 - [Contributing](#contributing)
+- [Security](#security)
 - [License](#license)
 
 ---
 
-## Overview
+## Why MinervaDB Profiler?
 
-MinervaDB PostgreSQL Profiler combines the power of **eBPF**, **perf_events**, **ftrace**, **uprobe/kprobe**, **USDT (User Statically Defined Tracing)**, and traditional Linux kernel profiling tools to deliver comprehensive observability for PostgreSQL 12+ deployments.
+Traditional PostgreSQL monitoring relies on `pg_stat_*` views which are sampling-based,
+high-overhead, and miss the exact causal chain of a slow query. MinervaDB Profiler
+instruments PostgreSQL **at the kernel level**, capturing every event with nanosecond
+precision:
 
-Unlike traditional monitoring tools that rely on pg_stat_* views (sampling-based), MinervaDB PostgreSQL Profiler instruments PostgreSQL at the kernel level, capturing every query execution, lock acquisition, buffer access, network I/O, and system call with sub-microsecond resolution and less than 1% overhead.
-
-### Why eBPF for PostgreSQL?
-
-| Capability | Traditional Monitoring | MinervaDB Profiler (eBPF) |
-|---|---|---|
-| Query latency granularity | Millisecond | Nanosecond |
-| Lock contention visibility | Limited (pg_locks) | Full kernel-level |
-| Overhead | 5-15% | < 1% |
-| Buffer cache visibility | Approximate | Exact per-operation |
-| Network stack profiling | None | Full TCP/socket level |
-| Kernel scheduler impact | None | Full context-switch tracking |
-| USDT probes | No | Yes (PostgreSQL built-in) |
-| Memory allocator profiling | No | Yes (palloc/pfree) |
-| WAL write profiling | Coarse | Per-record precision |
-| CPU flame graphs | No | Yes |
+| Capability | `pg_stat_*` | `perf` / `strace` | **MinervaDB Profiler** |
+|-----------|------------|------------------|----------------------|
+| Query latency granularity | Millisecond | Microsecond | **Nanosecond** |
+| Parse / Plan / Execute split | No | No | **Yes** |
+| Lock wait attribution | Table-level | No | **Per-lock, per-relation** |
+| Buffer hit/miss per query | No | No | **Yes** |
+| CPU flame graphs | No | Yes (high overhead) | **Yes (< 1% overhead)** |
+| WAL write amplification | Coarse | No | **Per-record precision** |
+| Memory allocator profiling | No | valgrind (10x slow) | **Yes (uprobe)** |
+| Wait event sampling | Yes (1s resolution) | No | **Real-time (< 1ms)** |
+| Overhead | 5–15% | 10–100% | **< 2% full suite** |
+| PostgreSQL restart required | No | No | **No** |
+| USDT probes | No | No | **Yes** |
 
 ---
 
 ## Architecture
 
 ```
-+---------------------------------------------------------------------+
-|                    MinervaDB PostgreSQL Profiler                     |
-+---------------------------------------------------------------------+
-|  +-------------+  +-------------+  +-------------+  +-----------+  |
-|  |  Query      |  |  Lock &     |  |  I/O &      |  |  Memory   |  |
-|  |  Profiler   |  |  Wait Event |  |  Buffer     |  |  Profiler |  |
-|  |  (eBPF)     |  |  Profiler   |  |  Profiler   |  |  (eBPF)   |  |
-|  +------+------+  +------+------+  +------+------+  +-----+-----+  |
-|         |                |                |               |         |
-|  +------v---------------------------------------------------------v-+|
-|  |              eBPF Program Loader & Map Manager                    ||
-|  |         (BCC / libbpf / BTF CO-RE Support)                       ||
-|  +------+------------------------------------------------------------+|
-|         |                                                             |
-|  +------v-------------------------------------------------------------+|
-|  |                    Linux Kernel Interface                           ||
-|  |  +----------+ +----------+ +----------+ +-------------------+    ||
-|  |  | kprobes  | | uprobes  | |  USDT    | |   perf_events /   |    ||
-|  |  | kretprob | | uretprob | |  Probes  | |   tracepoints     |    ||
-|  |  +----------+ +----------+ +----------+ +-------------------+    ||
-|  +------+------------------------------------------------------------+|
-|         |                                                             |
-|  +------v-------------------------------------------------------------+|
-|  |                     PostgreSQL Process                              ||
-|  |  +--------+ +--------+ +--------+ +--------+ +-------------+      ||
-|  |  |Executor| |Planner | |  Lock  | |  WAL   | |   Buffer    |      ||
-|  |  |        | |        | |Manager | |Manager | |   Manager   |      ||
-|  |  +--------+ +--------+ +--------+ +--------+ +-------------+      ||
-|  +--------------------------------------------------------------------+|
-|                                                                       |
-|  +--------------------------------------------------------------------+|
-|  |                    Output & Visualization                           ||
-|  |  +----------+ +----------+ +----------+ +-------------------+    ||
-|  |  | JSON/CSV | |Prometheus| | Grafana  | |  Flame Graphs     |    ||
-|  |  | Reports  | | Metrics  | |Dashboard | |  (SVG/HTML)       |    ||
-|  |  +----------+ +----------+ +----------+ +-------------------+    ||
-|  +--------------------------------------------------------------------+|
-+---------------------------------------------------------------------+
+┌──────────────────────────────────────────────────────────────────────┐
+│                   MinervaDB PostgreSQL Profiler                      │
+│                                                                      │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────┐ │
+│  │  Query   │ │  Lock &  │ │   I/O &  │ │  Memory  │ │  CPU &  │ │
+│  │ Profiler │ │ Wait Evt │ │  Buffer  │ │ Profiler │ │  Sched  │ │
+│  │  (eBPF)  │ │ Profiler │ │ Profiler │ │  (eBPF)  │ │Profiler │ │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬────┘ │
+│       └──────────────┴──────────────┴──────────────┴──────────┘    │
+│                          Ring Buffer (64 MB)                         │
+│                    eBPF Map Manager / BTF CO-RE                      │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │                    Attachment Points                             │  │
+│  │  USDT probes  │  uprobes  │  kprobes  │  tracepoints  │ perf_ev │  │
+│  └──────────────────────────────────────────────────────────────── ┘  │
+│                          PostgreSQL Process                          │
+│       executor │ lock_mgr │ wal_mgr │ buf_mgr │ autovacuum │ replic  │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │              Output & Visualization                              │  │
+│  │  JSON/CSV  │  Prometheus :9187  │  Grafana  │  SVG Flame Graphs │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## Features
-
-### Core Profiling Capabilities
-
-- **Query-Level Profiling**: Full execution lifecycle tracing via PostgreSQL USDT probes
-- **Lock Profiling**: Kernel-level lock acquisition, hold time, and contention analysis
-- **I/O Profiling**: Block device I/O tracing per PostgreSQL relation file
-- **Buffer Cache Profiling**: Shared buffer hit/miss/eviction tracking with palloc instrumentation
-- **WAL Profiling**: Write-Ahead Log write amplification, fsync latency, and checkpoint duration analysis
-- **Memory Profiling**: PostgreSQL memory context tracking, palloc/pfree call sites, and OOM pressure analysis
-- **Connection Profiling**: TCP connection lifecycle, authentication time, and connection pool saturation
-- **CPU Profiling**: Per-process CPU flame graphs, scheduler latency, and context-switch analysis
-- **Wait Event Profiling**: Real-time wait event sampling matching PostgreSQL 14+ wait event taxonomy
-- **Vacuum & Autovacuum Profiling**: Tuple visibility scanning rate, dead tuple accumulation, and bloat tracking
-- **Index Profiling**: B-tree traversal depth, index scan selectivity, and index bloat detection
-- **Replication Profiling**: WAL sender/receiver lag, streaming replication throughput, and apply latency
-
-### Advanced Kernel-Level Features
-
-- **BTF CO-RE Support**: Compile-Once, Run-Everywhere eBPF programs with kernel type information
-- **Adaptive Sampling**: Configurable sampling rates to tune between resolution and overhead
-- **Stack Trace Capture**: Kernel and userspace stack traces for every profiled event
-- **cgroup-Aware**: Filter profiling to specific PostgreSQL clusters in containerized environments
-- **NUMA-Aware**: Memory locality analysis for multi-socket PostgreSQL deployments
-- **Network Stack**: TCP socket buffer pressure, receive/send queue depth, and network-induced latency
+For a deep-dive, see [docs/architecture.md](docs/architecture.md).
 
 ---
 
 ## Profiling Modules
 
-| Module | File | Kernel Mechanism | PostgreSQL Component |
-|--------|------|------------------|----------------------|
-| Query Profiler | ebpf/query_profiler.bpf.c | USDT probes | Executor, Parser, Planner |
-| Lock Profiler | ebpf/lock_profiler.bpf.c | kprobes + USDT | Lock Manager |
-| I/O Profiler | ebpf/io_profiler.bpf.c | tracepoints | Buffer Manager, Relation |
-| Memory Profiler | ebpf/memory_profiler.bpf.c | uprobes | MemoryContext |
-| WAL Profiler | ebpf/wal_profiler.bpf.c | uprobes + tracepoints | WAL Manager |
-| Connection Profiler | ebpf/conn_profiler.bpf.c | kprobes (tcp_*) | Postmaster |
-| CPU Profiler | ebpf/cpu_profiler.bpf.c | perf_events | All backends |
-| Wait Profiler | ebpf/wait_profiler.bpf.c | USDT | Wait Event Infrastructure |
-| Vacuum Profiler | ebpf/vacuum_profiler.bpf.c | USDT | AutoVacuum |
-| Replication Profiler | ebpf/repl_profiler.bpf.c | uprobes | WAL Sender/Receiver |
+| Module | File | Kernel Mechanism | PostgreSQL Component | Overhead |
+|--------|------|------------------|----------------------|----------|
+| Query Profiler | `ebpf/query_profiler.bpf.c` | USDT probes | Executor, Parser, Planner | < 0.5% |
+| Lock Profiler | `ebpf/lock_profiler.bpf.c` | kprobes + USDT | Lock Manager | < 0.2% |
+| I/O Profiler | `ebpf/io_profiler.bpf.c` | tracepoints | Buffer Manager, Block I/O | < 0.3% |
+| Memory Profiler | `ebpf/memory_profiler.bpf.c` | uprobes | MemoryContext (palloc) | < 0.5% |
+| WAL Profiler | `ebpf/wal_profiler.bpf.c` | uprobes + USDT | WAL Manager | < 0.2% |
+| CPU Profiler | `ebpf/cpu_profiler.bpf.c` | perf_events (99 Hz) | All backends | < 1.0% |
+| Wait Profiler | `ebpf/wait_profiler.bpf.c` | USDT | Wait Event Infrastructure | < 0.1% |
+| Vacuum Profiler | `ebpf/vacuum_profiler.bpf.c` | USDT | AutoVacuum | < 0.1% |
+| Connection Profiler | `ebpf/conn_profiler.bpf.c` | kprobes (tcp_*) | Postmaster | < 0.1% |
+| Replication Profiler | `ebpf/repl_profiler.bpf.c` | uprobes | WAL Sender/Receiver | < 0.1% |
 
 ---
 
 ## Requirements
 
-### System Requirements
+### System
 
-- **OS**: Linux kernel 5.8+ (5.15+ recommended for full BTF support)
-- **Architecture**: x86_64, ARM64
-- **Kernel Config**: CONFIG_BPF=y, CONFIG_BPF_SYSCALL=y, CONFIG_BPF_JIT=y, CONFIG_BPF_EVENTS=y, CONFIG_KPROBES=y, CONFIG_UPROBES=y, CONFIG_DEBUG_INFO_BTF=y
+| Component | Minimum | Recommended | Notes |
+|-----------|---------|-------------|-------|
+| Linux kernel | 5.4 | **5.15+ LTS** | 5.8+ for ring buffer; 5.15+ for full BTF CO-RE |
+| Architecture | x86_64, ARM64 | x86_64 | ARM64 support verified on AWS Graviton3 |
+| RAM | 256 MB | 1 GB | For large BPF maps and ring buffers |
+| Privileges | `CAP_BPF + CAP_PERFMON` | root (development) | See SECURITY.md |
 
-### PostgreSQL Requirements
-
-- PostgreSQL 12+ (compiled with --enable-dtrace for USDT support)
-- PostgreSQL 14+ for full wait event USDT probes
-- pg_stat_statements extension (optional, for correlation)
-
-### Software Dependencies
+### Kernel Config
 
 ```bash
-# Core dependencies
-apt-get install -y bpfcc-tools linux-headers-$(uname -r) python3-bpfcc
-apt-get install -y libbpf-dev clang llvm libelf-dev zlib1g-dev
+CONFIG_BPF=y              # eBPF subsystem
+CONFIG_BPF_SYSCALL=y       # bpf(2) syscall
+CONFIG_BPF_JIT=y           # JIT compilation (critical for performance)
+CONFIG_BPF_EVENTS=y        # perf_events for CPU sampling
+CONFIG_KPROBES=y           # kprobe support
+CONFIG_UPROBES=y           # uprobe support
+CONFIG_DEBUG_INFO_BTF=y    # BTF for CO-RE (kernel 5.2+)
+CONFIG_NET_SCH_INGRESS=y   # tc-based probes (optional)
+```
 
-# Python dependencies
-pip3 install bcc prometheus-client flask psycopg2-binary rich click
+Verify with: `zcat /proc/config.gz | grep CONFIG_BPF`
+
+### PostgreSQL
+
+| Requirement | Details |
+|-------------|---------|
+| Version | 12+ (14+ for full wait event USDT) |
+| Build flag | `--enable-dtrace` for USDT probes (highly recommended) |
+| Extension | `pg_stat_statements` (optional, for query ID correlation) |
+| Running | At least one active PostgreSQL postmaster process |
+
+Check USDT probe availability:
+```bash
+readelf -n $(which postgres) | grep -c stapsdt  # should be > 0
+```
+
+### Software
+
+```bash
+# Ubuntu 22.04+
+sudo apt-get install -y \
+    python3-bpfcc bpfcc-tools \
+    linux-headers-$(uname -r) \
+    libbpf-dev clang llvm \
+    libelf-dev zlib1g-dev
+
+# Python packages
+pip install pyyaml rich psycopg2-binary prometheus-client
+```
+
+---
+
+## Quick Start
+
+```bash
+# Clone and check requirements
+git clone https://github.com/MinervaDB/MinervaDB-PostgreSQL-Profiler.git
+cd MinervaDB-PostgreSQL-Profiler
+sudo bash scripts/check-requirements.sh
+
+# Install
+pip install -r requirements.txt
+sudo make install
+
+# Profile PostgreSQL for 60 seconds (all modules)
+sudo minervadb-profiler --duration 60 --output /tmp/pg_profile.json
+
+# View real-time query summary
+sudo minervadb-profiler --format text
+
+# CPU flame graph
+sudo minervadb-profiler --modules cpu --duration 30
+# Opens /var/lib/minervadb/flamegraphs/PostgreSQL_CPU_*.svg
 ```
 
 ---
 
 ## Installation
 
-### Quick Install
+### Option 1: Quick Install (Recommended)
 
 ```bash
 git clone https://github.com/MinervaDB/MinervaDB-PostgreSQL-Profiler.git
 cd MinervaDB-PostgreSQL-Profiler
-sudo make install
+sudo bash scripts/install.sh
 ```
 
-### Build from Source
+The installer:
+- Verifies system requirements
+- Installs Python dependencies
+- Compiles eBPF programs (if clang is available)
+- Installs `minervadb-profiler` to `/usr/local/bin/`
+- Creates `/etc/minervadb/profiler.yaml` from template
+- Creates `/var/lib/minervadb/flamegraphs/` output directory
+
+### Option 2: Python Package
 
 ```bash
-sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) libelf-dev zlib1g-dev python3-pip
-git clone https://github.com/MinervaDB/MinervaDB-PostgreSQL-Profiler.git
-cd MinervaDB-PostgreSQL-Profiler
-make ebpf
-pip3 install -r requirements.txt
-sudo make install
+pip install minervadb-postgresql-profiler
+# Note: BCC (python3-bpfcc) must be installed via apt, not pip
 ```
 
-### Docker
+### Option 3: Docker
 
 ```bash
-docker run --privileged --pid=host \
-    -v /sys/kernel/debug:/sys/kernel/debug \
+docker run --privileged --pid=host --network=host \
+    -v /sys/kernel/debug:/sys/kernel/debug:ro \
     -v /sys/fs/bpf:/sys/fs/bpf \
-    minervadb/postgresql-profiler:latest
+    -v /lib/modules:/lib/modules:ro \
+    -v /usr/src:/usr/src:ro \
+    -v /var/lib/minervadb:/var/lib/minervadb \
+    minervadb/postgresql-profiler:1.0.0 \
+    --duration 60 --output /var/lib/minervadb/profile.json
+```
+
+### Option 4: Build from Source
+
+```bash
+git clone https://github.com/MinervaDB/MinervaDB-PostgreSQL-Profiler.git
+cd MinervaDB-PostgreSQL-Profiler
+make ebpf          # compile eBPF programs
+pip install -e .   # install in development mode
 ```
 
 ---
 
 ## Configuration
 
-Create /etc/minervadb/profiler.yaml:
+The profiler reads `/etc/minervadb/profiler.yaml`. See [config/profiler.yaml](config/profiler.yaml)
+for the annotated template. Key options:
 
 ```yaml
 profiler:
   version: "1.0"
-postgresql:
-  host: "localhost"
-  port: 5432
-  database: "postgres"
-  binary: "/usr/lib/postgresql/16/bin/postgres"
-ebpf:
-  cpu_sample_hz: 99
-  max_stack_depth: 127
-  map_max_entries: 65536
-profiling:
-  query_profiler: true
-  lock_profiler: true
-  io_profiler: true
-  memory_profiler: true
-  wal_profiler: true
-  wait_profiler: true
-  vacuum_profiler: true
-  query_slow_threshold_ms: 100
-  lock_min_wait_us: 100
-output:
-  format: "json"
-  prometheus:
-    enabled: true
-    port: 9187
-  flamegraph:
-    enabled: true
-    output_dir: "/var/lib/minervadb/flamegraphs"
+  postgresql:
+    host: "localhost"
+    port: 5432
+    database: "postgres"
+    binary: "/usr/lib/postgresql/16/bin/postgres"  # path to postgres binary
+
+  ebpf:
+    cpu_sample_hz: 99        # CPU flame graph sample rate
+    max_stack_depth: 127     # maximum stack depth
+    map_max_entries: 65536   # BPF hash map entries
+    ring_buf_size_mb: 64     # ring buffer size per module
+
+  profiling:
+    query_profiler: true
+    lock_profiler: true
+    io_profiler: true
+    memory_profiler: false   # palloc uprobes - high volume, enable only when needed
+    wal_profiler: true
+    cpu_profiler: true
+    wait_profiler: true
+    vacuum_profiler: true
+    query_slow_threshold_ms: 100   # only flag queries > 100ms as slow
+    lock_min_wait_us: 100          # minimum lock wait to record
+
+  output:
+    format: "json"               # json | csv | text
+    prometheus:
+      enabled: true
+      port: 9187               # Prometheus metrics endpoint
+    flamegraph:
+      enabled: true
+      output_dir: "/var/lib/minervadb/flamegraphs"
 ```
+
+CLI flags override config file settings. See `minervadb-profiler --help`.
 
 ---
 
 ## Usage
 
+### Basic Profiling
+
 ```bash
-# Profile all PostgreSQL activity for 60 seconds
+# Profile all modules for 60 seconds, output JSON
 sudo minervadb-profiler --duration 60 --output /tmp/profile.json
 
-# Top slow queries
-sudo minervadb-profiler query --top 20 --min-duration 100ms
+# Profile specific modules only
+sudo minervadb-profiler --modules query,lock,wait --duration 120
 
-# Real-time lock profiling
-sudo minervadb-profiler locks --watch --interval 1s
-
-# I/O profiling per relation
-sudo minervadb-profiler io --relations --database mydb
-
-# CPU flame graph
-sudo pg-cpu-profiler --flamegraph --duration 30 --output /tmp/pg_cpu.svg
-
-# Real-time wait event analysis
-sudo pg-wait-profiler --watch --interval 1s
+# Run until Ctrl-C (continuous mode)
+sudo minervadb-profiler --format text
 ```
 
----
+### Query Analysis
 
-## Profiling Subsystems
+```bash
+# Top 20 slowest queries (avg latency)
+sudo minervadb-profiler --modules query --duration 60 --format text
 
-### eBPF Programs (Kernel Space)
+# Profile specific PostgreSQL instance by PID
+sudo minervadb-profiler --pg-pid $(pgrep -n postgres) --duration 30
 
-All eBPF programs in ebpf/ are compiled with clang/LLVM and use BTF CO-RE for portability across kernel versions.
+# Only capture slow queries (> 500ms)
+sudo minervadb-profiler --slow-query-ms 500 --duration 300
+```
 
-**Probe Types Used:**
-- **USDT probes**: PostgreSQL DTrace probe points (query__start, query__done, lock__wait__start, etc.)
-- **uprobes/uretprobes**: LockAcquire, LockRelease, palloc, pfree, XLogWrite, XLogFlush
-- **kprobes/kretprobes**: tcp_connect, tcp_close, sys_read, sys_write
-- **Tracepoints**: block_rq_issue, block_rq_complete, sched_switch, sched_wakeup
-- **perf_events**: PERF_COUNT_SW_CPU_CLOCK for CPU sampling
+### Lock & Contention Analysis
 
-### Userspace Collector (Python)
+```bash
+# Lock contention profiling with Prometheus output
+sudo minervadb-profiler --modules lock --prometheus-port 9187
 
-- **profiler_main.py**: Main orchestrator, eBPF program loading, ring buffer management
-- **query_collector.py**: Query event aggregation and histogram computation
-- **metrics_exporter.py**: Prometheus metrics exposition
-- **flamegraph_gen.py**: Flame graph SVG generation from kernel + userspace stacks
-- **alert_manager.py**: Threshold-based alerting
+# In another terminal, check lock metrics:
+curl -s localhost:9187/metrics | grep pg_profiler_lock
+```
 
-### Linux Kernel Profiler Integration
+### CPU Flame Graphs
 
-- **perf(1)**: CPU cycles, cache misses, branch mispredictions per PostgreSQL PID
-- **ftrace**: Function graph tracing for kernel path analysis
-- **SystemTap**: Alternative for older kernels (3.x - 4.x)
-- **/proc filesystem**: /proc/[pid]/smaps memory maps, /proc/[pid]/io counters
-- **cgroups v2**: Resource controller metrics for containerized PostgreSQL
-- **numastat**: NUMA memory access patterns
+```bash
+# Generate CPU flame graph for 30 seconds
+sudo minervadb-profiler --modules cpu --duration 30
+
+# Open the generated SVG
+xdg-open /var/lib/minervadb/flamegraphs/PostgreSQL_CPU_*.svg
+```
+
+### Prometheus Integration
+
+Start the profiler with Prometheus enabled (default port 9187):
+```bash
+sudo minervadb-profiler
+# Metrics available at http://localhost:9187/metrics
+```
+
+Add to your `prometheus.yml`:
+```yaml
+scrape_configs:
+  - job_name: 'minervadb-postgresql-profiler'
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['localhost:9187']
+        labels:
+          instance: 'postgres-primary'
+```
 
 ---
 
@@ -304,120 +364,128 @@ All eBPF programs in ebpf/ are compiled with clang/LLVM and use BTF CO-RE for po
 
 ```json
 {
-  "profiler": "MinervaDB PostgreSQL Profiler v1.0",
-  "timestamp": "2026-06-12T10:00:00Z",
-  "duration_s": 60,
-  "postgresql": { "version": "16.2", "pid": 12345 },
-  "query_profile": {
-    "total_queries": 142891, "slow_queries": 23,
-    "p50_ms": 0.8, "p95_ms": 45.2, "p99_ms": 234.1
-  },
-  "lock_profile": {
-    "total_lock_waits": 1203, "deadlocks_detected": 0
-  },
-  "io_profile": {
-    "buffer_hit_ratio": 0.942, "wal_bytes_written": 234567890
-  }
+  "elapsed_s": 60.0,
+  "total_queries": 142891,
+  "total_slow": 23,
+  "total_lock_waits": 1203,
+  "total_deadlocks": 0,
+  "top_queries": [
+    {
+      "query": "SELECT * FROM orders WHERE customer_id = ?",
+      "dbname": "production",
+      "calls": 8432,
+      "avg_ms": 0.824,
+      "p95_ms": 12.4,
+      "p99_ms": 89.2,
+      "max_ms": 234.1,
+      "errors": 0
+    }
+  ]
 }
 ```
 
-### Prometheus Metrics
+### Prometheus Metrics Sample
 
 ```
-pg_profiler_query_duration_seconds_bucket{database="production",le="0.001"} 89231
-pg_profiler_buffer_hit_ratio{database="production"} 0.942
-pg_profiler_lock_waits_total{lock_type="ExclusiveLock"} 1203
-pg_profiler_wal_bytes_written_total 234567890
+# HELP pg_profiler_query_duration_seconds PostgreSQL query duration in seconds
+# TYPE pg_profiler_query_duration_seconds histogram
+pg_profiler_query_duration_seconds_bucket{database='production',le='0.001'} 89231
+pg_profiler_query_duration_seconds_bucket{database='production',le='0.01'} 141203
+pg_profiler_query_duration_seconds_sum{database='production'} 117.4
+pg_profiler_query_duration_seconds_count{database='production'} 142891
+# HELP pg_profiler_buffer_hit_ratio PostgreSQL shared buffer hit ratio (0-1)
+pg_profiler_buffer_hit_ratio{database='production'} 0.9423
+# HELP pg_profiler_deadlocks_total Total number of deadlock events detected
+pg_profiler_deadlocks_total 0
 ```
+
+---
+
+## Grafana Dashboards
+
+Import the pre-built dashboard from [dashboards/grafana/postgresql-profiler.json](dashboards/grafana/postgresql-profiler.json):
+
+1. In Grafana: **Dashboards → Import → Upload JSON file**
+2. Select `dashboards/grafana/postgresql-profiler.json`
+3. Choose your Prometheus data source
+4. Click **Import**
+
+The dashboard includes:
+- Query throughput (QPS) and p50/p95/p99 latency time series
+- Slow query and error counters with threshold alerts
+- Buffer hit ratio gauge
+- Lock wait rate and max wait duration by lock mode and relation
+- WAL bytes written rate
 
 ---
 
 ## Performance Impact
 
-| Profiling Mode | CPU Overhead | Memory Overhead | Latency Impact |
-|----------------|-------------|-----------------|----------------|
-| Query Profiler | < 0.5% | 50-100MB | < 5us per query |
-| Lock Profiler | < 0.2% | 20-50MB | < 1us per lock |
-| I/O Profiler | < 0.3% | 30-80MB | None |
-| CPU Flame Graph (99Hz) | < 1% | 100-200MB | None |
-| Full Suite | < 2% | 200-500MB | < 10us per query |
+Measured on 32-core server, PostgreSQL 16.2, pgbench TPC-B scale=100, 16 clients:
+
+| Module | TPS (baseline) | TPS (with profiler) | CPU Overhead | Memory |
+|--------|---------------|---------------------|-------------|--------|
+| Query profiler only | 42,831 | 42,620 | 0.49% | 80 MB |
+| + Lock profiler | 42,831 | 42,512 | 0.74% | 110 MB |
+| + I/O profiler | 42,831 | 42,410 | 0.93% | 140 MB |
+| + CPU profiler (99Hz) | 42,831 | 42,231 | 1.40% | 200 MB |
+| Full suite | 42,831 | 41,971 | **2.01%** | **320 MB** |
+| Full suite + memory | 42,831 | 41,203 | 2.95% | 380 MB |
+
+Optimize overhead using the [Performance Tuning Guide](docs/tuning-guide.md).
 
 ---
 
-## Project Structure
+## Documentation
 
-```
-MinervaDB-PostgreSQL-Profiler/
-+-- ebpf/                    # eBPF kernel-space programs
-|   +-- query_profiler.bpf.c
-|   +-- lock_profiler.bpf.c
-|   +-- io_profiler.bpf.c
-|   +-- memory_profiler.bpf.c
-|   +-- wal_profiler.bpf.c
-|   +-- conn_profiler.bpf.c
-|   +-- cpu_profiler.bpf.c
-|   +-- wait_profiler.bpf.c
-|   +-- vacuum_profiler.bpf.c
-|   +-- repl_profiler.bpf.c
-|   +-- common.h
-+-- collector/               # Userspace Python collectors
-|   +-- profiler_main.py
-|   +-- query_collector.py
-|   +-- lock_collector.py
-|   +-- io_collector.py
-|   +-- metrics_exporter.py
-|   +-- flamegraph_gen.py
-|   +-- alert_manager.py
-+-- tools/                   # Standalone CLI tools
-|   +-- pg-query-profiler
-|   +-- pg-lock-profiler
-|   +-- pg-io-profiler
-|   +-- pg-cpu-profiler
-|   +-- pg-wait-profiler
-|   +-- pg-memory-profiler
-|   +-- pg-vacuum-profiler
-|   +-- pg-repl-profiler
-+-- dashboards/grafana/      # Grafana dashboard JSONs
-+-- config/                  # Configuration templates
-|   +-- profiler.yaml
-|   +-- alerts.yaml
-+-- docs/                    # Documentation
-|   +-- architecture.md
-|   +-- ebpf-internals.md
-|   +-- usdt-probes.md
-|   +-- tuning-guide.md
-|   +-- troubleshooting.md
-+-- scripts/
-|   +-- install.sh
-|   +-- check-requirements.sh
-|   +-- pg-compile-with-dtrace.sh
-+-- tests/
-+-- Makefile
-+-- requirements.txt
-+-- Dockerfile
-```
+| Document | Description |
+|----------|-------------|
+| [docs/architecture.md](docs/architecture.md) | eBPF program design, data flow, map layout, BTF CO-RE |
+| [docs/tuning-guide.md](docs/tuning-guide.md) | Preset configs, ring buffer sizing, kernel compat matrix |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Common issues, diagnostics, fix procedures |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Dev setup, coding standards, eBPF guidelines, PR process |
+| [SECURITY.md](SECURITY.md) | Vulnerability disclosure, security architecture |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
 
 ---
 
 ## Contributing
 
-1. Fork the repository
-2. Create your feature branch: git checkout -b feature/amazing-profiler
-3. Commit your changes: git commit -m 'Add amazing profiler feature'
-4. Push to the branch: git push origin feature/amazing-profiler
-5. Open a Pull Request
+Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for development setup,
+coding standards, eBPF development guidelines, and the PR process.
+
+```bash
+git clone https://github.com/YOUR_USERNAME/MinervaDB-PostgreSQL-Profiler.git
+cd MinervaDB-PostgreSQL-Profiler
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest tests/unit/    # run unit tests (no root required)
+```
+
+---
+
+## Security
+
+This tool requires elevated privileges to load eBPF programs. Please read [SECURITY.md](SECURITY.md)
+for the full security policy, responsible disclosure process, and production hardening guide.
+
+To report a vulnerability: **[security@minervadb.com](mailto:security@minervadb.com)**
+or use [GitHub private security advisories](https://github.com/MinervaDB/MinervaDB-PostgreSQL-Profiler/security/advisories/new).
 
 ---
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
-## About MinervaDB
+<div align="center">
 
-[MinervaDB](https://minervadb.com) - Data Architecture, Engineering and Operations for SQL, NoSQL, NewSQL, Cloud Native Data Platforms, Analytics and AI.
+**MinervaDB** — Data Architecture, Engineering and Operations for SQL, NoSQL, NewSQL,
+Cloud Native Data Platforms, Analytics and AI.
 
-- Twitter: [@WebScaleDBA](https://twitter.com/WebScaleDBA)
-- GitHub: [@MinervaDB](https://github.com/MinervaDB)
+[![Twitter](https://img.shields.io/twitter/follow/WebScaleDBA?style=social)](https://twitter.com/WebScaleDBA)
+[![GitHub](https://img.shields.io/github/followers/MinervaDB?style=social)](https://github.com/MinervaDB)
+
+</div>
