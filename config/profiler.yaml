@@ -1,0 +1,418 @@
+# ============================================================
+# MinervaDB PostgreSQL Profiler - Configuration File
+# Version: 1.0.0
+# Copyright (c) 2026 MinervaDB Inc.
+#
+# Configuration file location: /etc/minervadb/profiler.yaml
+# ============================================================
+
+# ============================================================
+# Profiler Identity
+# ============================================================
+profiler:
+  version: "1.0.0"
+  name: "MinervaDB PostgreSQL Profiler"
+  
+  # Instance identifier (useful for multi-cluster setups)
+  instance_id: "pg-prod-01"
+  
+  # Environment label (dev/staging/production)
+  environment: "production"
+
+
+# ============================================================
+# PostgreSQL Connection Configuration
+# ============================================================
+postgresql:
+  # Connection details (for pg_stat_* correlation)
+  host: "localhost"
+  port: 5432
+  database: "postgres"
+  user: "profiler_user"
+  # password: ""  # Use PGPASSWORD env var or .pgpass instead
+
+  # Path to PostgreSQL binary for USDT probe attachment
+  # Leave empty for auto-detection
+  binary: "/usr/lib/postgresql/16/bin/postgres"
+  
+  # PostgreSQL data directory
+  data_dir: "/var/lib/postgresql/16/main"
+  
+  # WAL directory (if separate from data_dir)
+  wal_dir: ""
+  
+  # SSL configuration
+  ssl: false
+  ssl_cert: ""
+  ssl_key: ""
+  ssl_ca: ""
+
+
+# ============================================================
+# eBPF Configuration
+# ============================================================
+ebpf:
+  # BTF file path for CO-RE support
+  # Leave empty for auto-detection (/sys/kernel/btf/vmlinux)
+  btf_path: ""
+  
+  # CPU sampling frequency for CPU flame graphs (Hz)
+  # Lower values = less overhead, lower resolution
+  # Higher values = more detail, more overhead
+  # Recommended: 49, 99, 199 (prime numbers avoid lock-step sampling)
+  cpu_sample_hz: 99
+  
+  # Maximum call stack depth to capture
+  max_stack_depth: 127
+  
+  # eBPF map maximum entries (affects memory usage)
+  map_max_entries: 65536
+  
+  # Ring buffer size per profiler module (bytes)
+  # Increase if events are being dropped
+  ring_buffer_size: 16777216  # 16MB
+  
+  # Stack trace map size
+  stack_trace_map_size: 131072
+  
+  # Path to compiled eBPF objects
+  # Leave empty to use auto-detected path
+  ebpf_object_dir: "/var/lib/minervadb/ebpf"
+  
+  # Kernel function symbol file (for uprobe resolution)
+  # Default: /proc/kallsyms
+  kallsyms: "/proc/kallsyms"
+
+
+# ============================================================
+# Profiling Module Configuration
+# ============================================================
+profiling:
+
+  # --- Query Profiler ---
+  query_profiler: true
+  
+  # Minimum query duration to record (0 = record all)
+  query_min_duration_ms: 0
+  
+  # Slow query threshold for alerts and special logging
+  query_slow_threshold_ms: 100
+  
+  # Maximum query samples to keep in memory
+  query_max_samples: 10000
+  
+  # Include query text in events (disable for privacy/PII)
+  query_include_text: true
+  
+  # Maximum query text length to capture
+  query_text_max_len: 4096
+  
+  
+  # --- Lock Profiler ---
+  lock_profiler: true
+  
+  # Minimum lock wait duration to record (microseconds)
+  lock_min_wait_us: 100
+  
+  # Track LWLock (lightweight lock) waits
+  lock_track_lwlocks: true
+  
+  # Minimum LWLock wait to record (microseconds)
+  lwlock_min_wait_us: 10
+  
+  # Enable deadlock detection instrumentation
+  lock_deadlock_detection: true
+  
+  # Track lock hold time (time from acquire to release)
+  lock_track_hold_time: true
+  
+  
+  # --- I/O Profiler ---
+  io_profiler: true
+  
+  # Track block device reads
+  io_track_reads: true
+  
+  # Track block device writes
+  io_track_writes: true
+  
+  # Track fsync/checkpoint operations
+  io_track_fsync: true
+  
+  # Track storage manager (smgr) operations per relation
+  io_track_smgr: true
+  
+  # Minimum I/O latency to record (microseconds)
+  io_min_latency_us: 100
+  
+  
+  # --- Memory Profiler ---
+  memory_profiler: false  # Disabled by default (higher overhead)
+  
+  # Minimum allocation size to track (bytes)
+  memory_min_alloc_bytes: 1024
+  
+  # Track memory context hierarchy
+  memory_track_contexts: true
+  
+  
+  # --- WAL Profiler ---
+  wal_profiler: true
+  
+  # Track WAL write operations
+  wal_track_writes: true
+  
+  # Track WAL flush (fsync) operations
+  wal_track_flushes: true
+  
+  # Track checkpoint duration
+  wal_track_checkpoints: true
+  
+  
+  # --- Connection Profiler ---
+  connection_profiler: true
+  
+  # Track TCP connection lifecycle
+  connection_track_tcp: true
+  
+  # Track authentication duration
+  connection_track_auth: true
+  
+  
+  # --- CPU Profiler ---
+  cpu_profiler: true
+  
+  # Collect on-CPU flame graph data
+  cpu_oncpu: true
+  
+  # Collect off-CPU (wait time) data
+  cpu_offcpu: true
+  
+  # Generate periodic flame graphs automatically
+  cpu_auto_flamegraph: false
+  cpu_auto_flamegraph_interval_s: 300
+  
+  
+  # --- Wait Event Profiler ---
+  wait_profiler: true
+  
+  # Minimum wait duration to record (microseconds)
+  wait_min_duration_us: 100
+  
+  # Poll interval for pg_stat_activity correlation (ms)
+  wait_poll_interval_ms: 1000
+  
+  
+  # --- Vacuum Profiler ---
+  vacuum_profiler: true
+  
+  # Track autovacuum operations
+  vacuum_track_autovacuum: true
+  
+  # Track manual VACUUM
+  vacuum_track_manual: true
+  
+  # Track ANALYZE operations
+  vacuum_track_analyze: true
+  
+  
+  # --- Replication Profiler ---
+  replication_profiler: false  # Enable only on primary/replica
+  
+  # Track WAL sender (primary side)
+  replication_track_sender: true
+  
+  # Track WAL receiver (replica side)
+  replication_track_receiver: true
+
+
+# ============================================================
+# Output Configuration
+# ============================================================
+output:
+  # Output format: json, prometheus, csv, text
+  format: "json"
+  
+  # Output file path (empty = stdout)
+  file: "/var/log/minervadb/profiler.log"
+  
+  # Log rotation
+  log_rotate: true
+  log_max_size_mb: 500
+  log_keep_files: 7
+  
+  # Prometheus metrics endpoint
+  prometheus:
+    enabled: true
+    host: "0.0.0.0"
+    port: 9187
+    path: "/metrics"
+    # Include system metrics alongside profiler metrics
+    include_system_metrics: false
+  
+  # Real-time web dashboard
+  dashboard:
+    enabled: false
+    host: "0.0.0.0"
+    port: 8080
+    # Authentication for dashboard (empty = no auth)
+    username: ""
+    password: ""
+    # Update interval for live data
+    refresh_interval_s: 5
+  
+  # Flame graph output
+  flamegraph:
+    enabled: true
+    output_dir: "/var/lib/minervadb/flamegraphs"
+    # Format: svg, html
+    format: "svg"
+    # Minimum frame weight to include (% of total samples)
+    min_frame_weight: 0.1
+    # Color scheme: hot, cold, mem, io
+    color_scheme: "hot"
+    # Include kernel frames in flame graph
+    include_kernel: true
+    # Auto-generate at this interval (0 = on-demand only)
+    auto_generate_interval_s: 0
+    # Maximum flame graphs to keep
+    max_files: 100
+    
+  # Report generation
+  reports:
+    enabled: true
+    output_dir: "/var/lib/minervadb/reports"
+    # Generate periodic summary reports
+    periodic_report_interval_s: 3600  # Every hour
+    format: "json"  # json, html, pdf
+
+
+# ============================================================
+# Alerting Configuration
+# ============================================================
+alerting:
+  # Enable alerting
+  enabled: true
+  
+  # Minimum time between duplicate alerts (seconds)
+  alert_cooldown_s: 300
+  
+  # --- Query Alerts ---
+  # Alert on queries exceeding this duration
+  slow_query_alert_threshold_ms: 1000
+  
+  # Alert when slow query rate exceeds this (queries/minute)
+  slow_query_rate_threshold: 10
+  
+  # --- Lock Alerts ---
+  # Alert on lock waits exceeding this duration
+  lock_wait_alert_threshold_ms: 500
+  
+  # Alert on deadlock detection
+  deadlock_alert: true
+  
+  # --- Buffer Cache Alerts ---
+  # Alert when buffer hit ratio drops below this
+  buffer_miss_ratio_threshold: 0.10  # 10% miss rate
+  
+  # --- WAL Alerts ---
+  # Alert when WAL generation exceeds this (MB/s)
+  wal_write_rate_threshold_mbps: 100
+  
+  # --- Connection Alerts ---
+  # Alert when active connections exceed this
+  max_connections_threshold: 90  # % of max_connections
+  
+  # --- Alert Output ---
+  # Options: log, webhook, pagerduty, slack, email
+  alert_outputs:
+    - log
+    # - webhook
+  
+  # Webhook configuration (for PagerDuty, Alertmanager, etc.)
+  webhook:
+    url: ""
+    method: "POST"
+    headers:
+      Content-Type: "application/json"
+    # Payload template (Go template format)
+    payload_template: |
+      {
+        "alert": "{{.Name}}",
+        "severity": "{{.Severity}}",
+        "message": "{{.Message}}",
+        "database": "{{.Database}}",
+        "timestamp": "{{.Timestamp}}"
+      }
+  
+  # Slack configuration
+  slack:
+    webhook_url: ""
+    channel: "#database-alerts"
+    username: "MinervaDB Profiler"
+
+
+# ============================================================
+# Sampling & Filtering
+# ============================================================
+sampling:
+  # Global sampling rate (1.0 = 100%, 0.1 = 10%)
+  # Useful for very high-throughput systems
+  global_rate: 1.0
+  
+  # Per-module sampling rates (overrides global_rate)
+  query_rate: 1.0
+  lock_rate: 1.0
+  io_rate: 1.0
+  cpu_rate: 1.0
+  
+  # Filter to specific databases (empty = all databases)
+  databases: []
+  # Example:
+  # databases:
+  #   - production
+  #   - analytics
+  
+  # Filter to specific users (empty = all users)
+  users: []
+  
+  # Exclude these databases from profiling
+  exclude_databases:
+    - template0
+    - template1
+  
+  # Exclude these users
+  exclude_users:
+    - replication
+  
+  # Exclude queries matching these patterns (regex)
+  exclude_query_patterns: []
+  # Example:
+  # exclude_query_patterns:
+  #   - "^BEGIN"
+  #   - "^COMMIT"
+  #   - "pg_catalog\."
+
+
+# ============================================================
+# Advanced Performance Tuning
+# ============================================================
+performance:
+  # Number of worker threads for event processing
+  worker_threads: 4
+  
+  # Event queue depth (increase if dropping events)
+  event_queue_depth: 65536
+  
+  # Batch size for Prometheus metric updates
+  metrics_batch_size: 1000
+  
+  # Memory limit for in-memory aggregation (MB)
+  max_memory_mb: 512
+  
+  # Enable NUMA-aware memory allocation
+  numa_aware: false
+  
+  # Pin profiler threads to specific CPUs
+  # (empty = no pinning)
+  cpu_affinity: []
