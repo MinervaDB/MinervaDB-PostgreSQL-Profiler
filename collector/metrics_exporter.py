@@ -4,600 +4,251 @@
 MinervaDB PostgreSQL Profiler - Prometheus Metrics Exporter
 ===========================================================
 
-Exports profiling metrics in Prometheus exposition format.
-Runs an HTTP server at /metrics endpoint for Prometheus scraping.
+Exposes profiling data collected by the eBPF modules as a Prometheus
+metrics endpoint on /metrics.  Designed to integrate with standard
+Prometheus + Grafana observability stacks.
 
 Metrics exposed:
-  - pg_profiler_query_duration_seconds (histogram)
-  - pg_profiler_query_total (counter)
-  - pg_profiler_slow_queries_total (counter)
-  - pg_profiler_buffer_hit_ratio (gauge)
-  - pg_profiler_lock_waits_total (counter)
-  - pg_profiler_lock_wait_duration_seconds (histogram)
-  - pg_profiler_deadlocks_total (counter)
-  - pg_profiler_wait_event_total (counter by type)
-  - pg_profiler_wait_event_duration_seconds (histogram by type)
-  - pg_profiler_io_read_bytes_total (counter)
-  - pg_profiler_io_write_bytes_total (counter)
-  - pg_profiler_io_read_duration_seconds (histogram)
-  - pg_profiler_io_fsync_duration_seconds (histogram)
-  - pg_profiler_wal_bytes_total (counter)
-  - pg_profiler_connections_total (counter)
-  - pg_profiler_active_connections (gauge)
+  pg_profiler_query_duration_seconds   - query latency histogram (by db, type)
+  pg_profiler_query_total              - total query counter (by db)
+  pg_profiler_slow_queries_total       - slow query counter (by db)
+  pg_profiler_query_errors_total       - query error counter (by db)
+  pg_profiler_lock_wait_seconds        - lock wait histogram (by mode, relation)
+  pg_profiler_lock_waits_total         - total lock wait counter
+  pg_profiler_deadlocks_total          - deadlock counter
+  pg_profiler_io_bytes_total           - bytes read/written (by device, direction)
+  pg_profiler_io_ops_total             - I/O operations (by device, direction)
+  pg_profiler_io_latency_seconds       - I/O latency histogram
+  pg_profiler_buffer_hit_ratio         - shared buffer cache hit ratio
+  pg_profiler_wal_bytes_total          - WAL bytes written
+  pg_profiler_scrape_duration_seconds  - exporter internal scrape duration
 
 Copyright (c) 2026 MinervaDB Inc.
+License: MIT
 """
 
+from __future__ import annotations
+
 import time
-import threading
 import logging
-from typing import Dict, Optional, Any
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import TYPE_CHECKING, List, Optional
 from io import StringIO
 
-try:
-    from prometheus_client import (
-        Counter, Gauge, Histogram, Summary, Info,
-        CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST,
-        start_http_server
-    )
-    HAS_PROMETHEUS_CLIENT = True
-except ImportError:
-    HAS_PROMETHEUS_CLIENT = False
+if TYPE_CHECKING:
+    from collector.profiler_main import EventAggregator, ProfilerConfig
 
-logger = logging.getLogger("minervadb.metrics_exporter")
+log = logging.getLogger('minervadb.metrics')
 
-# ============================================================
-# Metric Definitions
-# ============================================================
+# ---------------------------------------------------------------------------
+# Prometheus text format helpers
+# ---------------------------------------------------------------------------
+def _labels(**kv) -> str:
+    """Format label dict as Prometheus label string."""
+    if not kv:
+        return ''
+    parts = [f'{k}={repr(str(v))}' for k, v in sorted(kv.items())]
+    return '{' + ','.join(parts) + '}'
+
+class PrometheusRegistry:
+    """Minimal Prometheus text-format metric registry."""
+
+    def __init__(self) -> None:
+        self._lines: List[str] = []
+
+    def _emit(self, name: str, labels: dict, value: float,
+              kind: str, help_text: str, unit: str = '') -> None:
+        full = name + (f'_{unit}' if unit else '')
+        self._lines.append(f'# HELP {full} {help_text}')
+        self._lines.append(f'# TYPE {full} {kind}')
+        self._lines.append(f'{full}{_labels(**labels)} {value}')
+
+    def counter(self, name: str, value: float, help_text: str, **labels) -> None:
+        self._emit(name, labels, value, 'counter', help_text)
+
+    def gauge(self, name: str, value: float, help_text: str, **labels) -> None:
+        self._emit(name, labels, value, 'gauge', help_text)
+
+    def histogram(self, name: str, samples: list, buckets: list,
+                  help_text: str, **labels) -> None:
+        self._lines.append(f'# HELP {name} {help_text}')
+        self._lines.append(f'# TYPE {name} histogram')
+        label_str = _labels(**labels)
+        sorted_s = sorted(samples)
+        total = len(sorted_s)
+        idx = 0
+        for b in buckets:
+            while idx < total and sorted_s[idx] <= b:
+                idx += 1
+            self._lines.append(f'{name}_bucket{_labels(le=b, **labels)} {idx}')
+        self._lines.append(f'{name}_bucket{_labels(le="+Inf", **labels)} {total}')
+        self._lines.append(f'{name}_count{label_str} {total}')
+        s = sum(sorted_s) if sorted_s else 0
+        self._lines.append(f'{name}_sum{label_str} {s:.6f}')
+
+    def render(self) -> str:
+        return '\n'.join(self._lines) + '\n'
+
+    def reset(self) -> None:
+        self._lines = []
 
 # Query latency histogram buckets (in seconds)
-QUERY_LATENCY_BUCKETS = (
-    0.0001,   # 100us
-    0.0005,   # 500us
-    0.001,    # 1ms
-    0.005,    # 5ms
-    0.01,     # 10ms
-    0.025,    # 25ms
-    0.05,     # 50ms
-    0.1,      # 100ms
-    0.25,     # 250ms
-    0.5,      # 500ms
-    1.0,      # 1s
-    2.5,      # 2.5s
-    5.0,      # 5s
-    10.0,     # 10s
-    30.0,     # 30s
-    float("inf")
-)
+QUERY_BUCKETS = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+LOCK_BUCKETS  = [0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+IO_BUCKETS    = [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
 
-# I/O latency histogram buckets (in seconds)
-IO_LATENCY_BUCKETS = (
-    0.0001,   # 100us (fast SSD)
-    0.0005,   # 500us
-    0.001,    # 1ms
-    0.005,    # 5ms
-    0.01,     # 10ms
-    0.05,     # 50ms
-    0.1,      # 100ms
-    0.5,      # 500ms
-    1.0,      # 1s (very slow)
-    float("inf")
-)
-
-# Lock wait histogram buckets (in seconds)
-LOCK_WAIT_BUCKETS = (
-    0.000100,  # 100us
-    0.000500,  # 500us
-    0.001,     # 1ms
-    0.005,     # 5ms
-    0.010,     # 10ms
-    0.050,     # 50ms
-    0.100,     # 100ms
-    0.500,     # 500ms
-    1.000,     # 1s
-    5.000,     # 5s
-    float("inf")
-)
-
-
-class MinervaDBMetricsExporter:
+# ---------------------------------------------------------------------------
+# Metrics exporter
+# ---------------------------------------------------------------------------
+class MetricsExporter:
     """
-    Prometheus metrics exporter for MinervaDB PostgreSQL Profiler.
-
-    Maintains Prometheus metric objects and provides methods to update
-    them from eBPF profiling data. Exposes a /metrics HTTP endpoint.
+    Serves Prometheus metrics over HTTP.
+    Runs in its own daemon thread.
     """
 
-    def __init__(self, port: int = 9187, host: str = "0.0.0.0",
-                 registry: Optional[Any] = None):
-        self.port = port
-        self.host = host
+    def __init__(self, aggregator: 'EventAggregator', config: 'ProfilerConfig') -> None:
+        self.agg    = aggregator
+        self.config = config
+        self._registry = PrometheusRegistry()
+        self._lock = threading.Lock()
+        self._last_rendered: str = ''
 
-        if HAS_PROMETHEUS_CLIENT:
-            self.registry = registry or CollectorRegistry()
-            self._init_metrics()
-        else:
-            logger.warning(
-                "prometheus_client not installed. Metrics will not be exported. "
-                "Install with: pip3 install prometheus-client"
+    def collect(self) -> str:
+        """Build a fresh Prometheus text payload from current aggregator state."""
+        t0 = time.perf_counter()
+        reg = PrometheusRegistry()
+
+        with self.agg._lock:
+            # ---- Query metrics ----
+            total_q = self.agg.total_queries
+            total_s = self.agg.total_slow
+            total_lw= self.agg.total_lock_waits
+            total_dl= self.agg.total_deadlocks
+            q_stats = list(self.agg.query_stats.values())
+            l_stats = list(self.agg.lock_stats.values())
+            io_stats= list(self.agg.io_stats.values())
+
+        # Global counters
+        reg.counter('pg_profiler_query_total', total_q,
+                    'Total number of PostgreSQL queries observed')
+        reg.counter('pg_profiler_slow_queries_total', total_s,
+                    f'Queries exceeding {self.config.slow_query_ms}ms threshold')
+        reg.counter('pg_profiler_lock_waits_total', total_lw,
+                    'Total number of lock wait events')
+        reg.counter('pg_profiler_deadlocks_total', total_dl,
+                    'Total number of deadlock events detected')
+
+        # Per-query histograms and counters
+        for qs in q_stats:
+            db = qs.dbname or 'unknown'
+            samples_s = [x / 1e6 for x in qs.samples]  # us -> seconds
+            reg.histogram(
+                'pg_profiler_query_duration_seconds',
+                samples_s, QUERY_BUCKETS,
+                'PostgreSQL query duration in seconds',
+                database=db
             )
-            self.registry = None
+            reg.counter(f'pg_profiler_query_calls_total', qs.call_count,
+                        'Total calls per normalized query', database=db)
+            reg.counter('pg_profiler_query_errors_total', qs.error_count,
+                        'Total query error count', database=db)
+            total_buf = qs.buf_hit_total + qs.buf_read_total
+            if total_buf > 0:
+                reg.gauge('pg_profiler_buffer_hit_ratio',
+                          qs.buf_hit_total / total_buf,
+                          'PostgreSQL shared buffer hit ratio (0-1)',
+                          database=db)
+            reg.counter('pg_profiler_wal_bytes_total', qs.wal_bytes_total,
+                        'Total WAL bytes generated by profiled queries', database=db)
 
-        self._server_thread = None
-        self._running = False
+        # Lock metrics
+        for ls in l_stats:
+            reg.counter('pg_profiler_lock_waits_by_mode_total', ls.wait_count,
+                        'Lock wait count by mode and relation',
+                        lock_mode=ls.lock_mode, relation=ls.relation_name or 'unknown',
+                        database=ls.dbname or 'unknown')
+            reg.gauge('pg_profiler_lock_max_wait_seconds', ls.max_wait_us / 1e6,
+                      'Maximum observed lock wait duration in seconds',
+                      lock_mode=ls.lock_mode, relation=ls.relation_name or 'unknown')
 
-    def _init_metrics(self):
-        """Initialize all Prometheus metrics."""
-        labels = ["database", "host"]
+        # I/O metrics
+        for io in io_stats:
+            reg.counter('pg_profiler_io_read_bytes_total', io.read_bytes,
+                        'Total bytes read from block device', device=io.device)
+            reg.counter('pg_profiler_io_write_bytes_total', io.write_bytes,
+                        'Total bytes written to block device', device=io.device)
+            reg.counter('pg_profiler_io_read_ops_total', io.read_ops,
+                        'Total read I/O operations', device=io.device)
+            reg.counter('pg_profiler_io_write_ops_total', io.write_ops,
+                        'Total write I/O operations', device=io.device)
+            if io.read_lat_us:
+                reg.histogram('pg_profiler_io_read_latency_seconds',
+                              [x / 1e6 for x in io.read_lat_us], IO_BUCKETS,
+                              'Block I/O read latency in seconds', device=io.device)
+            if io.write_lat_us:
+                reg.histogram('pg_profiler_io_write_latency_seconds',
+                              [x / 1e6 for x in io.write_lat_us], IO_BUCKETS,
+                              'Block I/O write latency in seconds', device=io.device)
 
-        # ============================================================
-        # Query Metrics
-        # ============================================================
-        self.query_duration = Histogram(
-            "pg_profiler_query_duration_seconds",
-            "PostgreSQL query execution duration",
-            labelnames=labels + ["query_type"],
-            buckets=QUERY_LATENCY_BUCKETS,
-            registry=self.registry,
-        )
+        # Exporter self-metrics
+        scrape_dur = time.perf_counter() - t0
+        reg.gauge('pg_profiler_scrape_duration_seconds', scrape_dur,
+                  'Time taken to render metrics payload')
+        reg.gauge('pg_profiler_info', 1,
+                  'MinervaDB PostgreSQL Profiler metadata',
+                  version='1.0.0', backend='ebpf')
 
-        self.query_total = Counter(
-            "pg_profiler_queries_total",
-            "Total number of PostgreSQL queries executed",
-            labelnames=labels + ["query_type"],
-            registry=self.registry,
-        )
+        return reg.render()
 
-        self.slow_query_total = Counter(
-            "pg_profiler_slow_queries_total",
-            "Total number of slow PostgreSQL queries",
-            labelnames=labels + ["query_type"],
-            registry=self.registry,
-        )
+    # ------------------------------------------------------------------
+    # HTTP handler
+    # ------------------------------------------------------------------
+    def _make_handler(self):
+        exporter = self
 
-        self.query_rows_total = Counter(
-            "pg_profiler_query_rows_total",
-            "Total rows returned/affected by queries",
-            labelnames=labels + ["query_type", "operation"],
-            registry=self.registry,
-        )
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path not in ('/', '/metrics'):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                try:
+                    payload = exporter.collect()
+                    body = payload.encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Type',
+                                     'text/plain; version=0.0.4; charset=utf-8')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception as exc:
+                    log.error('Metrics handler error: %s', exc)
+                    self.send_response(500)
+                    self.end_headers()
 
-        # ============================================================
-        # Buffer Cache Metrics
-        # ============================================================
-        self.buffer_hits_total = Counter(
-            "pg_profiler_buffer_hits_total",
-            "Total PostgreSQL shared buffer cache hits",
-            labelnames=labels,
-            registry=self.registry,
-        )
+            def log_message(self, fmt, *args):
+                pass  # Suppress default HTTP access log to stderr
 
-        self.buffer_misses_total = Counter(
-            "pg_profiler_buffer_misses_total",
-            "Total PostgreSQL shared buffer cache misses (disk reads)",
-            labelnames=labels,
-            registry=self.registry,
-        )
+        return MetricsHandler
 
-        self.buffer_hit_ratio = Gauge(
-            "pg_profiler_buffer_hit_ratio",
-            "PostgreSQL shared buffer cache hit ratio (0.0-1.0)",
-            labelnames=labels,
-            registry=self.registry,
-        )
-
-        self.buffer_dirtied_total = Counter(
-            "pg_profiler_buffer_dirtied_total",
-            "Total shared buffers dirtied",
-            labelnames=labels,
-            registry=self.registry,
-        )
-
-        # ============================================================
-        # Lock Metrics
-        # ============================================================
-        self.lock_waits_total = Counter(
-            "pg_profiler_lock_waits_total",
-            "Total number of lock wait events",
-            labelnames=labels + ["lock_type", "lock_mode"],
-            registry=self.registry,
-        )
-
-        self.lock_wait_duration = Histogram(
-            "pg_profiler_lock_wait_duration_seconds",
-            "PostgreSQL lock wait duration",
-            labelnames=labels + ["lock_type", "lock_mode"],
-            buckets=LOCK_WAIT_BUCKETS,
-            registry=self.registry,
-        )
-
-        self.lock_hold_duration = Histogram(
-            "pg_profiler_lock_hold_duration_seconds",
-            "PostgreSQL lock hold duration",
-            labelnames=labels + ["lock_type", "lock_mode"],
-            buckets=LOCK_WAIT_BUCKETS,
-            registry=self.registry,
-        )
-
-        self.deadlocks_total = Counter(
-            "pg_profiler_deadlocks_total",
-            "Total number of deadlocks detected",
-            labelnames=labels,
-            registry=self.registry,
-        )
-
-        # ============================================================
-        # I/O Metrics
-        # ============================================================
-        self.io_reads_total = Counter(
-            "pg_profiler_io_reads_total",
-            "Total block I/O read operations",
-            labelnames=labels + ["relation"],
-            registry=self.registry,
-        )
-
-        self.io_writes_total = Counter(
-            "pg_profiler_io_writes_total",
-            "Total block I/O write operations",
-            labelnames=labels + ["relation"],
-            registry=self.registry,
-        )
-
-        self.io_read_bytes_total = Counter(
-            "pg_profiler_io_read_bytes_total",
-            "Total bytes read from disk",
-            labelnames=labels + ["relation"],
-            registry=self.registry,
-        )
-
-        self.io_write_bytes_total = Counter(
-            "pg_profiler_io_write_bytes_total",
-            "Total bytes written to disk",
-            labelnames=labels + ["relation"],
-            registry=self.registry,
-        )
-
-        self.io_read_duration = Histogram(
-            "pg_profiler_io_read_duration_seconds",
-            "Block I/O read latency",
-            labelnames=labels + ["device"],
-            buckets=IO_LATENCY_BUCKETS,
-            registry=self.registry,
-        )
-
-        self.io_write_duration = Histogram(
-            "pg_profiler_io_write_duration_seconds",
-            "Block I/O write latency",
-            labelnames=labels + ["device"],
-            buckets=IO_LATENCY_BUCKETS,
-            registry=self.registry,
-        )
-
-        self.io_fsync_duration = Histogram(
-            "pg_profiler_io_fsync_duration_seconds",
-            "fsync latency",
-            labelnames=labels,
-            buckets=IO_LATENCY_BUCKETS,
-            registry=self.registry,
-        )
-
-        # ============================================================
-        # WAL Metrics
-        # ============================================================
-        self.wal_bytes_total = Counter(
-            "pg_profiler_wal_bytes_total",
-            "Total WAL bytes generated",
-            labelnames=labels,
-            registry=self.registry,
-        )
-
-        self.wal_write_duration = Histogram(
-            "pg_profiler_wal_write_duration_seconds",
-            "WAL write duration",
-            labelnames=labels,
-            buckets=IO_LATENCY_BUCKETS,
-            registry=self.registry,
-        )
-
-        self.wal_flush_duration = Histogram(
-            "pg_profiler_wal_flush_duration_seconds",
-            "WAL flush (fsync) duration",
-            labelnames=labels,
-            buckets=IO_LATENCY_BUCKETS,
-            registry=self.registry,
-        )
-
-        # ============================================================
-        # Wait Event Metrics
-        # ============================================================
-        self.wait_events_total = Counter(
-            "pg_profiler_wait_events_total",
-            "Total wait events by type",
-            labelnames=labels + ["wait_type", "wait_event"],
-            registry=self.registry,
-        )
-
-        self.wait_event_duration = Histogram(
-            "pg_profiler_wait_event_duration_seconds",
-            "Wait event duration by type",
-            labelnames=labels + ["wait_type"],
-            buckets=LOCK_WAIT_BUCKETS,
-            registry=self.registry,
-        )
-
-        self.active_wait_events = Gauge(
-            "pg_profiler_active_wait_events",
-            "Current number of backends waiting by wait type",
-            labelnames=labels + ["wait_type"],
-            registry=self.registry,
-        )
-
-        # ============================================================
-        # Connection Metrics
-        # ============================================================
-        self.connections_total = Counter(
-            "pg_profiler_connections_total",
-            "Total PostgreSQL connections established",
-            labelnames=labels + ["application"],
-            registry=self.registry,
-        )
-
-        self.active_connections = Gauge(
-            "pg_profiler_active_connections",
-            "Current active PostgreSQL connections",
-            labelnames=labels,
-            registry=self.registry,
-        )
-
-        self.connection_duration = Histogram(
-            "pg_profiler_connection_duration_seconds",
-            "PostgreSQL session duration",
-            labelnames=labels + ["application"],
-            buckets=(1, 5, 30, 60, 300, 900, 3600, float("inf")),
-            registry=self.registry,
-        )
-
-        self.connection_auth_duration = Histogram(
-            "pg_profiler_connection_auth_duration_seconds",
-            "PostgreSQL authentication duration",
-            labelnames=labels,
-            buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, float("inf")),
-            registry=self.registry,
-        )
-
-        # ============================================================
-        # CPU Metrics
-        # ============================================================
-        self.cpu_usage_seconds_total = Counter(
-            "pg_profiler_cpu_usage_seconds_total",
-            "Total CPU time consumed by PostgreSQL backends",
-            labelnames=labels + ["state"],
-            registry=self.registry,
-        )
-
-        self.context_switches_total = Counter(
-            "pg_profiler_context_switches_total",
-            "Total context switches for PostgreSQL backends",
-            labelnames=labels + ["type"],
-            registry=self.registry,
-        )
-
-        # ============================================================
-        # Profiler Info Metric
-        # ============================================================
-        self.profiler_info = Info(
-            "pg_profiler",
-            "MinervaDB PostgreSQL Profiler information",
-            registry=self.registry,
-        )
-        self.profiler_info.info({
-            "version": "1.0.0",
-            "ebpf": "true",
-            "vendor": "MinervaDB Inc.",
-        })
-
-        # ============================================================
-        # Scrape Metrics
-        # ============================================================
-        self.scrape_duration = Gauge(
-            "pg_profiler_last_scrape_duration_seconds",
-            "Duration of last profiler data collection",
-            registry=self.registry,
-        )
-
-        self.scrape_success = Gauge(
-            "pg_profiler_last_scrape_success",
-            "Whether the last profiler scrape was successful (1=yes, 0=no)",
-            registry=self.registry,
-        )
-
-        logger.info("Prometheus metrics initialized")
-
-    def update_from_session(self, session: Any, database: str = "unknown",
-                            host: str = "localhost"):
-        """
-        Update all metrics from a ProfilingSession object.
-
-        Called periodically by the profiler to push current stats
-        to Prometheus metric objects.
-        """
-        if not HAS_PROMETHEUS_CLIENT or not self.registry:
-            return
-
-        start = time.time()
+    def run(self) -> None:
+        port = self.config.prometheus_port
+        server = HTTPServer(('', port), self._make_handler())
+        log.info('Prometheus metrics server listening on :%d/metrics', port)
         try:
-            labels = {"database": database, "host": host}
-
-            # Buffer cache metrics
-            if session.buffer_hits + session.buffer_misses > 0:
-                self.buffer_hit_ratio.labels(**labels).set(
-                    session.buffer_hit_ratio
-                )
-
-            # WAL metrics
-            self.wal_bytes_total.labels(**labels)._value.set(
-                session.wal_bytes
-            )
-
-            # Lock metrics
-            if session.deadlocks > 0:
-                self.deadlocks_total.labels(**labels)._value.set(
-                    session.deadlocks
-                )
-
-            # Wait event metrics
-            for wait_type, count in session.wait_event_counts.items():
-                self.wait_events_total.labels(
-                    wait_type=wait_type,
-                    wait_event="all",
-                    **labels
-                )._value.set(count)
-
-            self.scrape_success.set(1)
-
-        except Exception as e:
-            logger.error(f"Failed to update Prometheus metrics: {e}")
-            self.scrape_success.set(0)
-
+            server.serve_forever()
+        except Exception as exc:
+            log.error('Metrics server error: %s', exc)
         finally:
-            self.scrape_duration.set(time.time() - start)
+            server.server_close()
 
-    def record_query(self, duration_s: float, query_type: str,
-                     database: str = "unknown", host: str = "localhost",
-                     is_slow: bool = False, rows: int = 0,
-                     buffers_hit: int = 0, buffers_read: int = 0):
-        """Record metrics for a completed query."""
-        if not HAS_PROMETHEUS_CLIENT:
-            return
 
-        labels = {"database": database, "host": host, "query_type": query_type}
-
-        self.query_duration.labels(**labels).observe(duration_s)
-        self.query_total.labels(**labels).inc()
-
-        if is_slow:
-            self.slow_query_total.labels(**labels).inc()
-
-        if rows > 0:
-            self.query_rows_total.labels(
-                operation="returned", **labels
-            ).inc(rows)
-
-        if buffers_hit > 0:
-            self.buffer_hits_total.labels(
-                database=database, host=host
-            ).inc(buffers_hit)
-
-        if buffers_read > 0:
-            self.buffer_misses_total.labels(
-                database=database, host=host
-            ).inc(buffers_read)
-
-    def record_lock_wait(self, wait_s: float, lock_type: str, lock_mode: str,
-                         database: str = "unknown", host: str = "localhost"):
-        """Record metrics for a lock wait event."""
-        if not HAS_PROMETHEUS_CLIENT:
-            return
-
-        labels = {
-            "database": database, "host": host,
-            "lock_type": lock_type, "lock_mode": lock_mode
-        }
-        self.lock_waits_total.labels(**labels).inc()
-        self.lock_wait_duration.labels(**labels).observe(wait_s)
-
-    def record_io(self, duration_s: float, bytes_count: int, is_write: bool,
-                  device: str = "unknown", relation: str = "unknown",
-                  database: str = "unknown", host: str = "localhost"):
-        """Record metrics for an I/O operation."""
-        if not HAS_PROMETHEUS_CLIENT:
-            return
-
-        base_labels = {"database": database, "host": host}
-
-        if is_write:
-            self.io_writes_total.labels(
-                relation=relation, **base_labels
-            ).inc()
-            self.io_write_bytes_total.labels(
-                relation=relation, **base_labels
-            ).inc(bytes_count)
-            self.io_write_duration.labels(
-                device=device, **base_labels
-            ).observe(duration_s)
-        else:
-            self.io_reads_total.labels(
-                relation=relation, **base_labels
-            ).inc()
-            self.io_read_bytes_total.labels(
-                relation=relation, **base_labels
-            ).inc(bytes_count)
-            self.io_read_duration.labels(
-                device=device, **base_labels
-            ).observe(duration_s)
-
-    def record_wait_event(self, wait_type: str, wait_event: str,
-                          duration_s: float,
-                          database: str = "unknown", host: str = "localhost"):
-        """Record metrics for a wait event."""
-        if not HAS_PROMETHEUS_CLIENT:
-            return
-
-        self.wait_events_total.labels(
-            database=database, host=host,
-            wait_type=wait_type, wait_event=wait_event
-        ).inc()
-
-        self.wait_event_duration.labels(
-            database=database, host=host,
-            wait_type=wait_type
-        ).observe(duration_s)
-
-    def generate_text_metrics(self) -> str:
-        """
-        Generate Prometheus text format metrics manually
-        (used when prometheus_client is not available).
-        """
-        output = []
-        output.append("# MinervaDB PostgreSQL Profiler Metrics")
-        output.append(f"# Generated at {time.time()}")
-        output.append("")
-        output.append("# HELP pg_profiler_info Profiler version information")
-        output.append("# TYPE pg_profiler_info gauge")
-        output.append('pg_profiler_info{version="1.0.0",vendor="MinervaDB"} 1')
-        output.append("")
-        return "\n".join(output)
-
-    def start_server(self):
-        """Start the Prometheus HTTP metrics server."""
-        if not HAS_PROMETHEUS_CLIENT:
-            logger.error(
-                "prometheus_client not available. Cannot start metrics server. "
-                "Install with: pip3 install prometheus-client"
-            )
-            return
-
-        self._running = True
-
-        def serve():
-            try:
-                start_http_server(self.port, addr=self.host, registry=self.registry)
-                logger.info(
-                    f"Prometheus metrics server started on {self.host}:{self.port}/metrics"
-                )
-                while self._running:
-                    time.sleep(1)
-            except Exception as e:
-                logger.error(f"Metrics server failed: {e}")
-
-        self._server_thread = threading.Thread(target=serve, daemon=True)
-        self._server_thread.start()
-        logger.info(f"Metrics server starting on port {self.port}")
-
-    def stop_server(self):
-        """Stop the metrics server."""
-        self._running = False
-        if self._server_thread:
-            self._server_thread.join(timeout=5)
-        logger.info("Metrics server stopped")
+# ---------------------------------------------------------------------------
+# Standalone usage
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    import sys
+    print('Use minervadb-profiler to start the full profiler with metrics export.')
+    print('Direct invocation of metrics_exporter.py is not supported.')
+    sys.exit(1)
